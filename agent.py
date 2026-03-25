@@ -1,6 +1,7 @@
-import time
 import os
+import json
 import argparse
+import time
 import torch
 import torch.nn as nn
 import numpy as np
@@ -64,6 +65,28 @@ def load_model(ticker):
     scaler.n_features_in_ = INPUT_DIM
     print(Fore.GREEN + f"[*] Model for {ticker} loaded successfully.\n")
     return model, scaler
+
+
+def get_state_path(ticker):
+    clean_ticker = ticker.replace("=", "").replace("-", "_")
+    return f"{clean_ticker}_state.json"
+
+
+def load_state(ticker):
+    path = get_state_path(ticker)
+    if os.path.exists(path):
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except:
+            pass
+    return {"last_trend": "neutral", "last_price": 0.0}
+
+
+def save_state(ticker, state):
+    path = get_state_path(ticker)
+    with open(path, 'w') as f:
+        json.dump(state, f)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -149,21 +172,24 @@ def train_model(ticker, period="60d", interval="5m"):
 # Real-Time Agent Loop
 # ──────────────────────────────────────────────────────────────
 
-def run_realtime_agent(ticker, model, scaler, poll_interval=60, telegram_notifier=None):
-    """Main real-time monitoring loop."""
+def run_realtime_agent(ticker, model, scaler, poll_interval=60, telegram_notifier=None, once=False):
+    """Main real-time monitoring loop or single-run execution."""
     fetcher = DataFetcher(ticker)
     features = ['Open', 'High', 'Low', 'Close', 'Volume']
 
-    last_trend = 'neutral'
-    last_price = 0.0
+    # Load persistent state
+    state = load_state(ticker)
+    last_trend = state.get("last_trend", "neutral")
+    last_price = state.get("last_price", 0.0)
 
-    print(Fore.CYAN + Style.BRIGHT + f"\n{'='*58}")
-    print(Fore.CYAN + Style.BRIGHT + f"  Real-Time Market Monitor  |  Ticker: {ticker}")
-    print(Fore.CYAN + Style.BRIGHT + f"{'='*58}")
-    print(f"  Poll interval : {poll_interval}s")
-    print(f"  Telegram alerts: {'Enabled' if (telegram_notifier and telegram_notifier.bot_token) else 'Disabled'}")
-    print(Fore.CYAN + Style.BRIGHT + f"{'='*58}\n")
-    print("Press Ctrl+C to stop.\n")
+    if not once:
+        print(Fore.CYAN + Style.BRIGHT + f"\n{'='*58}")
+        print(Fore.CYAN + Style.BRIGHT + f"  Real-Time Market Monitor  |  Ticker: {ticker}")
+        print(Fore.CYAN + Style.BRIGHT + f"{'='*58}")
+        print(f"  Poll interval : {poll_interval}s")
+        print(f"  Telegram alerts: {'Enabled' if (telegram_notifier and telegram_notifier.bot_token) else 'Disabled'}")
+        print(Fore.CYAN + Style.BRIGHT + f"{'='*58}\n")
+        print("Press Ctrl+C to stop.\n")
 
     try:
         while True:
@@ -171,12 +197,16 @@ def run_realtime_agent(ticker, model, scaler, poll_interval=60, telegram_notifie
             # 5m interval is only available for the last 5 days — perfect for real-time monitoring
             df = fetcher.fetch_latest_data(period="5d", interval="5m", last_n=100)
             if df.empty:
+                if once:
+                    print(Fore.RED + "[!] Failed to fetch recent data. Exiting.")
+                    break
                 print(Fore.RED + "[!] Failed to fetch recent data. Retrying...")
                 time.sleep(poll_interval)
                 continue
 
             current_time = df['Datetime'].iloc[-1]
             current_close = float(df['Close'].iloc[-1])
+
 
             # ── Technical Analysis ─────────────────────────────
             supports, resistances = identify_support_resistance(df['Close'], window=5)
@@ -268,11 +298,17 @@ def run_realtime_agent(ticker, model, scaler, poll_interval=60, telegram_notifie
             else:
                 print(f"  Status       : No structural change. Holding {trend_color}{combined_trend.upper()}{'':>5}")
 
-            # Update state
+            # Update and persist state
             last_trend = combined_trend
             last_price = current_close
+            save_state(ticker, {"last_trend": last_trend, "last_price": last_price})
+
+            if once:
+                print(Fore.CYAN + "\n[*] Single run complete. State saved.")
+                break
 
             time.sleep(poll_interval)
+
 
     except KeyboardInterrupt:
         print(Fore.CYAN + "\n\n[*] Agent stopped by user. Goodbye!")
@@ -296,6 +332,8 @@ if __name__ == "__main__":
                         help="Telegram Bot Token (overrides .env)")
     parser.add_argument("--tg-chat",   type=str, default=None,
                         help="Telegram Chat ID (overrides .env)")
+    parser.add_argument("--once",      action="store_true",
+                        help="Run a single iteration and exit (for automation)")
     args = parser.parse_args()
 
     # Telegram credentials: CLI arg > .env file
@@ -321,8 +359,8 @@ if __name__ == "__main__":
             print(Fore.RED + "[!] Model initialization failed. Exiting.")
             exit(1)
     
-    # Send startup notification
-    if notifier and notifier.bot_token:
+    # Send startup notification (skip in 'once' mode to avoid spam)
+    if not args.once and notifier and notifier.bot_token:
         notifier.send_message(f"🚀 *Market Monitor Started*\nTicker: `{args.ticker}`\nInterval: `{args.interval}s`\nStatus: Monitoring for reversals...")
 
     # ── Start Agent ─────────────────────────────────────────
@@ -332,4 +370,5 @@ if __name__ == "__main__":
         scaler,
         poll_interval=args.interval,
         telegram_notifier=notifier,
+        once=args.once
     )

@@ -112,6 +112,34 @@ python agent.py --ticker BTC-USD --tg-token YOUR_TOKEN --tg-chat YOUR_CHAT_ID
 
 ---
 
+## 24/7 Free Monitoring (GitHub Actions)
+
+You can run this agent for free 24/7 using GitHub Actions. It is configured to run every 30 minutes, check the market, and alert you if the trend changes.
+
+### Setup
+
+1. **Push your code to GitHub**:
+   ```bash
+   git add .
+   git commit -m "Add GitHub Actions automation"
+   git push
+   ```
+
+2. **Configure Secrets**:
+   Go to your GitHub Repository -> **Settings** -> **Secrets and variables** -> **Actions** -> **New repository secret**.
+   Add the following secrets:
+   - `TELEGRAM_BOT_TOKEN`: Your bot token.
+   - `TELEGRAM_CHAT_ID`: Your chat ID.
+
+3. **Enable Permissions**:
+   Go to **Settings** -> **Actions** -> **General**.
+   Under **Workflow permissions**, select **Read and write permissions** (required for the bot to save the market state back to the repo).
+
+4. **Profit**:
+   The bot will now run automatically. You can check the progress in the **Actions** tab of your repository.
+
+---
+
 ## Project Structure
 
 ```
