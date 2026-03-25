@@ -26,7 +26,7 @@ jobs:
 
       - name: Run Market Monitor
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TRADING_IA_ALERT_BOT }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python agent.py --ticker "GC=F" --once
