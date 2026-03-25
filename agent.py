@@ -194,8 +194,8 @@ def run_realtime_agent(ticker, model, scaler, poll_interval=60, telegram_notifie
     try:
         while True:
             # ── Fetch latest bars ──────────────────────────────
-            # 5m interval is only available for the last 5 days — perfect for real-time monitoring
-            df = fetcher.fetch_latest_data(period="5d", interval="5m", last_n=100)
+            # 15m interval is a better balance for reliability
+            df = fetcher.fetch_latest_data(period="5d", interval="15m", last_n=100)
             if df.empty:
                 if once:
                     print(Fore.RED + "[!] Failed to fetch recent data. Exiting.")
