@@ -29,7 +29,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TRADING_IA_ALERT_BOT }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python agent.py --ticker "GC=F" --once
+          python agent.py --tickers "BTC-USD,GC=F" --once
 
       - name: Commit and push state changes
         run: |
