@@ -1,1 +1,1 @@
-{"last_trend": "bullish", "last_price": 78306.4296875}
+{"last_trend": "bullish", "last_price": 78475.0, "active_trade": {"direction": "COMPRA", "entry": 78475.0, "stop_loss": 78168.88, "tp1": 79087.24}, "last_alert_time": "2026-04-26T22:07:25.307629", "last_alert_type": "COMPRA", "alert_history": [{"time": "2026-04-26T22:07:25.307644", "type": "COMPRA", "price": 78475.0, "score": 68}]}
