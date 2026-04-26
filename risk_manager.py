@@ -106,6 +106,39 @@ class RiskManager:
             atr_multiplier=self.atr_multiplier,
         )
 
+    def update_trailing_stop(self, current_price: float, current_stop: float, entry: float, direction: str, atr: float) -> tuple[float, bool]:
+        """
+        Updates the trailing stop.
+        Moves stop to break-even if price moves 1x ATR in favor.
+        Returns (new_stop, was_updated)
+        """
+        new_stop = current_stop
+        updated = False
+
+        if direction == 'COMPRA':
+            # If price moved up by 1 ATR, move stop to entry (break-even)
+            if current_price >= entry + atr and current_stop < entry:
+                new_stop = entry
+                updated = True
+            # Basic trailing logic: if price continues to rise, trail by 1.5 ATR
+            trail_level = current_price - (atr * self.atr_multiplier)
+            if trail_level > new_stop:
+                new_stop = trail_level
+                updated = True
+                
+        else: # VENTA
+            # If price moved down by 1 ATR, move stop to entry (break-even)
+            if current_price <= entry - atr and current_stop > entry:
+                new_stop = entry
+                updated = True
+            # Basic trailing logic
+            trail_level = current_price + (atr * self.atr_multiplier)
+            if trail_level < new_stop:
+                new_stop = trail_level
+                updated = True
+
+        return round(new_stop, 2), updated
+
 
 def format_risk_profile(rp: RiskProfile, direccion: str) -> str:
     """Formatea el perfil de riesgo como texto para consola / Telegram."""

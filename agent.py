@@ -47,7 +47,7 @@ init(autoreset=True)
 load_dotenv()
 
 SEQ_LENGTH = 30
-INPUT_DIM = 5
+INPUT_DIM = 10  # OHLCV + RSI + MACD + ATR + BB_pct + ADX
 D_MODEL = 32
 NHEAD = 4
 NUM_LAYERS = 2
@@ -152,10 +152,24 @@ def train_model(ticker, period="60d", interval="1h"):
         return None, None
 
     features = ['Open', 'High', 'Low', 'Close', 'Volume']
-    scaler = StandardScaler()
-    scaled = scaler.fit_transform(df[features].values)
+    
+    # Pre-calcular features técnicos
+    from technical import calculate_rsi, calculate_macd, calculate_atr, calculate_bollinger_bands, calculate_adx
+    df['RSI'] = calculate_rsi(df['Close']).fillna(50)
+    _, _, macd_hist = calculate_macd(df['Close'])
+    df['MACD_Hist'] = macd_hist.fillna(0)
+    df['ATR'] = calculate_atr(df).fillna(0)
+    bb = calculate_bollinger_bands(df['Close'])
+    df['BB_pct'] = bb['percent_b'].fillna(0.5)
+    adx, _, _ = calculate_adx(df)
+    df['ADX'] = adx.fillna(0)
 
-    X, y = create_sequences(scaled, seq_length=SEQ_LENGTH)
+    tech_features = features + ['RSI', 'MACD_Hist', 'ATR', 'BB_pct', 'ADX']
+    
+    scaler = StandardScaler()
+    scaled = scaler.fit_transform(df[tech_features].values)
+
+    X, y = create_sequences(scaled, seq_length=SEQ_LENGTH, target_idx=3)
     if len(X) == 0:
         print(Fore.RED + "  ✗ Datos insuficientes para secuencias.")
         return None, None
@@ -327,11 +341,28 @@ def run_agent(tickers_info, risk_mgr, poll_interval=60, notifier=None, once=Fals
                 current_close = float(df['Close'].iloc[-1])
                 last_trend = state.get("last_trend", "neutral")
 
+                # ── Datos Macro (MTF) ──────────────────────────────
+                # Fetch 1d data for macro trend
+                macro_df = fetcher.fetch_latest_data(period="6mo", interval="1d", last_n=50)
+                macro_trend = 'neutral'
+                if not macro_df.empty:
+                    from technical import detect_trend
+                    macro_trend = detect_trend(macro_df['Close'], short_ma=10, long_ma=50)
+
                 # ── Análisis Técnico Completo ──────────────────────
                 tech = full_technical_analysis(df)
 
-                # ── Predicción IA ──────────────────────────────────
-                recent_data = df[features].tail(SEQ_LENGTH).values
+                # ── Predicción IA (Con Datos Enriquecidos) ─────────
+                # Construir DataFrame enriquecido como en train_model
+                df['RSI'] = tech['rsi']
+                df['MACD_Hist'] = tech['macd_hist']
+                df['ATR'] = tech['atr']
+                df['BB_pct'] = tech['bb_percent_b']
+                df['ADX'] = tech['adx']
+                
+                tech_features = features + ['RSI', 'MACD_Hist', 'ATR', 'BB_pct', 'ADX']
+                recent_data = df[tech_features].tail(SEQ_LENGTH).values
+                
                 if len(recent_data) < SEQ_LENGTH:
                     print(Fore.YELLOW + f"  ⏳ [{ticker}] Esperando datos ({len(recent_data)}/{SEQ_LENGTH})")
                     continue
@@ -347,7 +378,7 @@ def run_agent(tickers_info, risk_mgr, poll_interval=60, notifier=None, once=Fals
                 ai_trend = {0: 'bearish', 1: 'neutral', 2: 'bullish'}[pred_idx]
 
                 # ── Motor de Señales ───────────────────────────────
-                signal = evaluate_signal(tech, ai_trend, confidence)
+                signal = evaluate_signal(tech, ai_trend, confidence, macro_trend=macro_trend)
 
                 # ── Calcular Riesgo ────────────────────────────────
                 risk_profile = None
@@ -371,8 +402,57 @@ def run_agent(tickers_info, risk_mgr, poll_interval=60, notifier=None, once=Fals
                 else:
                     combined_trend = 'neutral'
 
+                # ── Gestión Activa (Trailing Stop & Win Rate) ──────
+                active_trade = state.get("active_trade")
+                if active_trade:
+                    # Update trailing stop
+                    new_stop, updated = risk_mgr.update_trailing_stop(
+                        current_close, active_trade["stop_loss"], active_trade["entry"],
+                        active_trade["direction"], tech['atr']
+                    )
+                    
+                    if updated:
+                        active_trade["stop_loss"] = new_stop
+                        logger.info(f"Trailing Stop {ticker} movido a {fmt(new_stop)}")
+                        if notifier and notifier.bot_token:
+                            notifier.send_message(f"🛡️ *TRAILING STOP* — {ticker}\nStop loss asegurado a: `${new_stop:,.2f}`")
+
+                    # Check hit TP or SL
+                    hit_tp = False
+                    hit_sl = False
+                    
+                    if active_trade["direction"] == 'COMPRA':
+                        if current_close >= active_trade["tp1"]: hit_tp = True
+                        elif current_close <= active_trade["stop_loss"]: hit_sl = True
+                    else: # VENTA
+                        if current_close <= active_trade["tp1"]: hit_tp = True
+                        elif current_close >= active_trade["stop_loss"]: hit_sl = True
+
+                    if hit_tp or hit_sl:
+                        outcome = "Ganancia (TP)" if hit_tp else "Pérdida (SL)"
+                        emoji = "✅" if hit_tp else "❌"
+                        state["wins"] = state.get("wins", 0) + (1 if hit_tp else 0)
+                        state["losses"] = state.get("losses", 0) + (1 if hit_sl else 0)
+                        
+                        logger.info(f"Trade cerrado: {ticker} -> {outcome}")
+                        if notifier and notifier.bot_token:
+                            notifier.send_message(f"{emoji} *OPERACIÓN CERRADA* — {ticker}\nResultado: {outcome}\nPrecio de salida: `${current_close:,.2f}`")
+                            
+                        state["active_trade"] = None
+                    else:
+                        state["active_trade"] = active_trade
+
                 # ── Alertas ────────────────────────────────────────
                 if signal.es_alerta and not is_alert_on_cooldown(state, signal.direccion):
+                    # Save active trade
+                    if risk_profile:
+                        state["active_trade"] = {
+                            "direction": signal.direccion,
+                            "entry": risk_profile.entrada,
+                            "stop_loss": risk_profile.stop_loss,
+                            "tp1": risk_profile.take_profit_1
+                        }
+                    
                     # Log detallado
                     logger.info(
                         f"ALERTA {signal.direccion} — {ticker} @ {fmt(current_close)} | "
@@ -382,11 +462,18 @@ def run_agent(tickers_info, risk_mgr, poll_interval=60, notifier=None, once=Fals
                     for d in signal.detalles:
                         logger.info(f"  └─ {d.nombre}: +{d.puntos}/{d.max_puntos} — {d.razon}")
 
+                    # Mostrar Win Rate si hay historial
+                    wins = state.get("wins", 0)
+                    losses = state.get("losses", 0)
+                    total = wins + losses
+                    wr_str = f"Win Rate: {wins/total*100:.1f}% ({wins}/{total})" if total > 0 else "Win Rate: N/A"
+
                     # Consola
                     alert_color = Fore.GREEN if signal.direccion == 'COMPRA' else Fore.RED
                     print()
                     print(alert_color + Style.BRIGHT + "  ╔══════════════════════════════════════════════════════════╗")
                     print(alert_color + Style.BRIGHT + f"  ║  ¡ALERTA {signal.direccion}!  │  {ticker}  │  {signal.fuerza}".ljust(61) + "║")
+                    print(alert_color + Style.BRIGHT + f"  ║  {wr_str}".ljust(61) + "║")
                     print(alert_color + Style.BRIGHT + "  ╚══════════════════════════════════════════════════════════╝")
 
                     # Detalles confluencia
@@ -404,7 +491,7 @@ def run_agent(tickers_info, risk_mgr, poll_interval=60, notifier=None, once=Fals
                             fuerza=signal.fuerza,
                             precio=current_close,
                             risk_text=risk_text,
-                            detalles_text=detalles_text,
+                            detalles_text=detalles_text + f"\n\n📈 {wr_str}",
                         )
 
                     # Actualizar cooldown

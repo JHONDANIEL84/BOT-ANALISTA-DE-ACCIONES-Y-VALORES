@@ -61,14 +61,15 @@ class TimeSeriesTransformer(nn.Module):
         return self.classifier(last_step)
 
 
-def create_sequences(data, seq_length=30):
+def create_sequences(data, seq_length=30, target_idx=3):
     """
     Convert (N, features) array to labelled sequences.
     Label is determined by whether the next close is up/down/flat vs current close.
     
     Args:
-        data: np.ndarray of shape (N, features). Close price assumed at index 3.
+        data: np.ndarray of shape (N, features).
         seq_length: int, length of each input sequence.
+        target_idx: int, index of the Close price in the features dimension.
     
     Returns:
         X: np.ndarray of shape (num_seq, seq_length, features)
@@ -77,8 +78,8 @@ def create_sequences(data, seq_length=30):
     xs, ys = [], []
     for i in range(len(data) - seq_length - 1):
         x = data[i:(i + seq_length)]
-        current_close = data[i + seq_length - 1, 3]  # Close is at index 3
-        next_close = data[i + seq_length, 3]
+        current_close = data[i + seq_length - 1, target_idx]
+        next_close = data[i + seq_length, target_idx]
 
         if current_close == 0:
             continue

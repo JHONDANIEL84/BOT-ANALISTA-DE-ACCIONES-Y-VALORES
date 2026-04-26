@@ -50,7 +50,7 @@ def classify_strength(score: int) -> str:
         return "DÉBIL"
 
 
-def evaluate_signal(tech: Dict, ai_trend: str, ai_confidence: float) -> SignalResult:
+def evaluate_signal(tech: Dict, ai_trend: str, ai_confidence: float, macro_trend: str = 'neutral') -> SignalResult:
     """
     Motor principal de confluencia.
     
@@ -58,6 +58,7 @@ def evaluate_signal(tech: Dict, ai_trend: str, ai_confidence: float) -> SignalRe
         tech: Diccionario de full_technical_analysis()
         ai_trend: Predicción del modelo ('bullish', 'bearish', 'neutral')
         ai_confidence: Confianza del modelo (0.0–1.0)
+        macro_trend: Tendencia en temporalidad mayor ('bullish', 'bearish', 'neutral')
     
     Returns:
         SignalResult con score, dirección, fuerza y detalles.
@@ -192,6 +193,20 @@ def evaluate_signal(tech: Dict, ai_trend: str, ai_confidence: float) -> SignalRe
     elif tech['stoch_overbought']:
         sell_pts += 5
         details_sell.append(SignalDetail("Stoch RSI", 5, 5, f"K={tech['stoch_k']:.0f} sobrecompra extrema"))
+
+    # ── 10. MTF Macro Trend Penalty ───────────────────────────
+    if macro_trend == 'bullish':
+        buy_pts += 5
+        details_buy.append(SignalDetail("Tendencia Macro", 5, 5, "A favor de la tendencia Diaria (MTF)"))
+        if sell_pts > 0:
+            sell_pts = max(0, sell_pts - 15)
+            details_sell.append(SignalDetail("Tendencia Macro", -15, 0, "En CONTRA de la tendencia Diaria (MTF)"))
+    elif macro_trend == 'bearish':
+        sell_pts += 5
+        details_sell.append(SignalDetail("Tendencia Macro", 5, 5, "A favor de la tendencia Diaria (MTF)"))
+        if buy_pts > 0:
+            buy_pts = max(0, buy_pts - 15)
+            details_buy.append(SignalDetail("Tendencia Macro", -15, 0, "En CONTRA de la tendencia Diaria (MTF)"))
 
     # ── Determinar dirección y fuerza ─────────────────────────
     # Cap at 100
