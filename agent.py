@@ -1,75 +1,118 @@
+"""
+agent.py — Agente de Trading Profesional
+==========================================
+Motor de señales por confluencia, gestión de riesgo ATR,
+dashboard profesional en consola, logging operativo,
+cooldown de alertas, análisis multi-indicador.
+
+Uso:
+  python agent.py                          # Monitoreo BTC + Oro por defecto
+  python agent.py --tickers BTC-USD,GC=F   # Tickers personalizados
+  python agent.py --once                   # Una sola ejecución
+  python agent.py --capital 5000           # Capital para position sizing
+"""
+
 import os
 import json
 import argparse
 import time
+import logging
+from datetime import datetime, timedelta
+
 import torch
 import torch.nn as nn
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-from colorama import init, Fore, Style
+from colorama import init, Fore, Style, Back
 from dotenv import load_dotenv
 
 from data_api import DataFetcher
-from technical import identify_support_resistance, detect_trend
+from technical import full_technical_analysis
+from signal_engine import evaluate_signal
+from risk_manager import RiskManager, format_risk_profile
 from transformer import TimeSeriesTransformer, create_sequences
 from telegram_notifier import TelegramNotifier
 
-# Initialize colorama for cross-platform colored output
-init(autoreset=True)
+# ──────────────────────────────────────────────────────────────
+# Configuración
+# ──────────────────────────────────────────────────────────────
+import sys
+import io
+# Forzar UTF-8 en Windows para caracteres Unicode
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-# Load .env file if present (for Telegram credentials)
+init(autoreset=True)
 load_dotenv()
 
-SEQ_LENGTH = 30  # bars used per sequence (works for both 1h and 5m data)
+SEQ_LENGTH = 30
 INPUT_DIM = 5
 D_MODEL = 32
 NHEAD = 4
 NUM_LAYERS = 2
 
+ALERT_COOLDOWN_MIN = 15   # Minutos entre alertas del mismo tipo/ticker
+
+# Logging profesional
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logger = logging.getLogger("MarketAgent")
+logger.setLevel(logging.DEBUG)
+
+fh = logging.FileHandler(os.path.join(LOG_DIR, "agent.log"), encoding="utf-8")
+fh.setLevel(logging.DEBUG)
+fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+logger.addHandler(fh)
+
+ch = logging.StreamHandler()
+ch.setLevel(logging.WARNING)
+logger.addHandler(ch)
+
+
 # ──────────────────────────────────────────────────────────────
 # Helpers
 # ──────────────────────────────────────────────────────────────
 
-def fmt_price(val):
-    """Format a price, returns 'N/A' if infinite."""
-    return f"${val:.2f}" if val not in (float('inf'), float('-inf')) else "N/A"
+def fmt(val, decimals=2):
+    """Formatea un precio. Usa separador de miles."""
+    if val in (float('inf'), float('-inf')):
+        return "N/A"
+    return f"${val:,.{decimals}f}"
 
 
 def get_model_paths(ticker):
-    # Sanitize ticker name for filename
-    clean_ticker = ticker.replace("=", "").replace("-", "_")
-    return f"{clean_ticker}_model.pt", f"{clean_ticker}_scaler.npz"
+    clean = ticker.replace("=", "").replace("-", "_")
+    return f"{clean}_model.pt", f"{clean}_scaler.npz"
+
+
+def get_state_path(ticker):
+    clean = ticker.replace("=", "").replace("-", "_")
+    return f"{clean}_state.json"
 
 
 def save_model(ticker, model, scaler):
-    m_path, s_path = get_model_paths(ticker)
-    torch.save(model.state_dict(), m_path)
-    np.savez(s_path, mean=scaler.mean_, scale=scaler.scale_)
-    print(Fore.CYAN + f"[*] Model & scaler saved to {m_path} / {s_path}")
+    mp, sp = get_model_paths(ticker)
+    torch.save(model.state_dict(), mp)
+    np.savez(sp, mean=scaler.mean_, scale=scaler.scale_)
+    logger.info(f"Modelo guardado: {mp}")
 
 
 def load_model(ticker):
-    """Try to load a pre-trained model and scaler from disk."""
-    m_path, s_path = get_model_paths(ticker)
-    if not (os.path.exists(m_path) and os.path.exists(s_path)):
+    mp, sp = get_model_paths(ticker)
+    if not (os.path.exists(mp) and os.path.exists(sp)):
         return None, None
-    print(Fore.CYAN + f"[*] Found saved model for {ticker}. Loading from disk...")
+    print(Fore.CYAN + f"  ✓ Modelo encontrado para {ticker}")
     model = TimeSeriesTransformer(input_dim=INPUT_DIM, d_model=D_MODEL, nhead=NHEAD, num_layers=NUM_LAYERS)
-    model.load_state_dict(torch.load(m_path, weights_only=True))
+    model.load_state_dict(torch.load(mp, weights_only=True))
     model.eval()
-
-    data = np.load(s_path)
+    data = np.load(sp)
     scaler = StandardScaler()
     scaler.mean_ = data['mean']
     scaler.scale_ = data['scale']
     scaler.n_features_in_ = INPUT_DIM
-    print(Fore.GREEN + f"[*] Model for {ticker} loaded successfully.\n")
     return model, scaler
-
-
-def get_state_path(ticker):
-    clean_ticker = ticker.replace("=", "").replace("-", "_")
-    return f"{clean_ticker}_state.json"
 
 
 def load_state(ticker):
@@ -78,240 +121,328 @@ def load_state(ticker):
         try:
             with open(path, 'r') as f:
                 return json.load(f)
-        except:
+        except Exception:
             pass
-    return {"last_trend": "neutral", "last_price": 0.0}
+    return {
+        "last_trend": "neutral",
+        "last_price": 0.0,
+        "last_alert_time": None,
+        "last_alert_type": None,
+        "alert_history": [],
+    }
 
 
 def save_state(ticker, state):
     path = get_state_path(ticker)
     with open(path, 'w') as f:
-        json.dump(state, f)
+        json.dump(state, f, default=str)
 
 
 # ──────────────────────────────────────────────────────────────
-# Training
+# Entrenamiento
 # ──────────────────────────────────────────────────────────────
 
-def train_model(ticker, period="60d", interval="5m"):
-    """Fetches historical data and trains the Transformer model."""
-    # Yahoo Finance limits: 5m -> max 5d, 1h -> max 60d, 1d -> max years.
-    # We use 1h/60d for training to get enough history.
-    print(Fore.YELLOW + f"\n[*] Fetching historical data for {ticker}  (period={period}, interval={interval})...")
+def train_model(ticker, period="60d", interval="1h"):
+    """Entrena el modelo Transformer con datos históricos."""
+    print(Fore.YELLOW + f"  ⏳ Descargando datos históricos para {ticker} ({period}/{interval})...")
     fetcher = DataFetcher(ticker)
     df = fetcher.fetch_historical_data(period=period, interval=interval)
     if df.empty:
-        print(Fore.RED + "[!] No data received from Yahoo Finance.")
+        print(Fore.RED + "  ✗ Sin datos de Yahoo Finance.")
         return None, None
 
-    print(Fore.YELLOW + f"[*] Fetched {len(df)} rows. Preparing sequences...")
     features = ['Open', 'High', 'Low', 'Close', 'Volume']
-    
     scaler = StandardScaler()
-    scaled_data = scaler.fit_transform(df[features].values)
+    scaled = scaler.fit_transform(df[features].values)
 
-    X, y = create_sequences(scaled_data, seq_length=SEQ_LENGTH)
+    X, y = create_sequences(scaled, seq_length=SEQ_LENGTH)
     if len(X) == 0:
-        print(Fore.RED + "[!] Not enough data to create sequences.")
+        print(Fore.RED + "  ✗ Datos insuficientes para secuencias.")
         return None, None
 
-    print(Fore.YELLOW + f"[*] Created {len(X)} sequences. Starting training...")
-    X_tensor = torch.tensor(X, dtype=torch.float32)
-    y_tensor = torch.tensor(y, dtype=torch.long)
-
-    # Class balance info
-    unique, counts = np.unique(y, return_counts=True)
-    label_names = {0: "Bearish", 1: "Neutral", 2: "Bullish"}
-    for u, c in zip(unique, counts):
-        print(f"    {label_names[u]}: {c} samples ({100*c/len(y):.1f}%)")
+    print(Fore.YELLOW + f"  ⏳ Entrenando modelo ({len(X)} secuencias)...")
+    X_t = torch.tensor(X, dtype=torch.float32)
+    y_t = torch.tensor(y, dtype=torch.long)
 
     model = TimeSeriesTransformer(input_dim=INPUT_DIM, d_model=D_MODEL, nhead=NHEAD, num_layers=NUM_LAYERS)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 
-    epochs = 15
-    batch_size = 64
-    best_loss = float('inf')
-    best_state = None
-
-    for epoch in range(epochs):
+    best_loss, best_state = float('inf'), None
+    for epoch in range(15):
         model.train()
-        epoch_loss = 0.0
-        num_batches = 0
-        for i in range(0, len(X_tensor), batch_size):
-            batch_X = X_tensor[i:i + batch_size]
-            batch_y = y_tensor[i:i + batch_size]
+        epoch_loss, batches = 0.0, 0
+        for i in range(0, len(X_t), 64):
+            bx, by = X_t[i:i+64], y_t[i:i+64]
             optimizer.zero_grad()
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
+            out = model(bx)
+            loss = criterion(out, by)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             epoch_loss += loss.item()
-            num_batches += 1
-
-        avg_loss = epoch_loss / max(num_batches, 1)
+            batches += 1
+        avg = epoch_loss / max(batches, 1)
         scheduler.step()
-        print(f"  Epoch {epoch+1:02d}/{epochs}  |  Loss: {avg_loss:.4f}  |  LR: {scheduler.get_last_lr()[0]:.6f}")
-
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        if avg < best_loss:
+            best_loss = avg
             best_state = {k: v.clone() for k, v in model.state_dict().items()}
 
-    # Restore best weights
     if best_state:
         model.load_state_dict(best_state)
-
-    print(Fore.GREEN + f"\n[*] Training complete. Best loss: {best_loss:.4f}\n")
+    print(Fore.GREEN + f"  ✓ Entrenamiento completo (loss: {best_loss:.4f})")
     save_model(ticker, model, scaler)
     return model, scaler
 
 
 # ──────────────────────────────────────────────────────────────
-# Real-Time Agent Loop
+# Dashboard Profesional
 # ──────────────────────────────────────────────────────────────
 
-def run_realtime_agent(ticker, model, scaler, poll_interval=60, telegram_notifier=None, once=False):
-    """Main real-time monitoring loop or single-run execution."""
-    fetcher = DataFetcher(ticker)
+def print_header(tickers_info, poll_interval, capital, notifier):
+    """Imprime el encabezado profesional."""
+    w = 72
+    print()
+    print(Fore.CYAN + Style.BRIGHT + "╔" + "═" * w + "╗")
+    print(Fore.CYAN + Style.BRIGHT + "║" + "  AGENTE DE TRADING PROFESIONAL".center(w) + "║")
+    print(Fore.CYAN + Style.BRIGHT + "║" + "  Análisis por Confluencia + IA".center(w) + "║")
+    print(Fore.CYAN + Style.BRIGHT + "╠" + "═" * w + "╣")
+    print(Fore.CYAN + "║" + f"  Activos     : {', '.join(tickers_info.keys())}".ljust(w) + "║")
+    print(Fore.CYAN + "║" + f"  Capital     : ${capital:,.2f}".ljust(w) + "║")
+    print(Fore.CYAN + "║" + f"  Intervalo   : {poll_interval}s".ljust(w) + "║")
+    tg_status = "✓ Activado" if (notifier and notifier.bot_token) else "✗ Desactivado"
+    print(Fore.CYAN + "║" + f"  Telegram    : {tg_status}".ljust(w) + "║")
+    print(Fore.CYAN + "║" + f"  Cooldown    : {ALERT_COOLDOWN_MIN} min entre alertas".ljust(w) + "║")
+    print(Fore.CYAN + "║" + f"  Inicio      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}".ljust(w) + "║")
+    print(Fore.CYAN + Style.BRIGHT + "╚" + "═" * w + "╝")
+    print()
+
+
+def print_ticker_analysis(ticker, price, tech, signal, risk_profile=None):
+    """Imprime el panel de análisis para un ticker."""
+    w = 72
+    dir_color = Fore.GREEN if signal.direccion == 'COMPRA' else Fore.RED if signal.direccion == 'VENTA' else Fore.YELLOW
+    trend_es = {
+        'bullish': 'ALCISTA', 'bearish': 'BAJISTA', 'neutral': 'NEUTRAL', 'mixed': 'MIXTO'
+    }
+
+    # Score bar visual
+    buy_bar = "█" * (signal.score_compra // 5) + "░" * (20 - signal.score_compra // 5)
+    sell_bar = "█" * (signal.score_venta // 5) + "░" * (20 - signal.score_venta // 5)
+
+    print(Fore.CYAN + Style.BRIGHT + "┌" + "─" * w + "┐")
+    print(Fore.CYAN + Style.BRIGHT + "│" + f"  {ticker}  │  {fmt(price)}  │  {datetime.now().strftime('%H:%M:%S')}".ljust(w) + "│")
+    print(Fore.CYAN + "├" + "─" * w + "┤")
+
+    # Indicadores clave
+    rsi_color = Fore.RED if tech['rsi_overbought'] else Fore.GREEN if tech['rsi_oversold'] else Fore.WHITE
+    adx_color = Fore.GREEN if tech['adx_strong'] else Fore.YELLOW
+
+    print(Fore.CYAN + "│" + f"  RSI: {rsi_color}{tech['rsi']:.1f}".ljust(w + 9) + Fore.CYAN + "│")
+    print(Fore.CYAN + "│" + f"  ADX: {adx_color}{tech['adx']:.1f}  {Fore.WHITE}(+DI: {tech['plus_di']:.1f}  -DI: {tech['minus_di']:.1f})".ljust(w + 18) + Fore.CYAN + "│")
+    print(Fore.CYAN + "│" + f"  ATR: {Fore.WHITE}{fmt(tech['atr'])} ({tech['atr_pct']:.2f}%)".ljust(w + 9) + Fore.CYAN + "│")
+    print(Fore.CYAN + "│" + f"  VWAP: {Fore.WHITE}{fmt(tech['vwap'])}  {'↑' if tech['above_vwap'] else '↓'} precio".ljust(w + 9) + Fore.CYAN + "│")
+    macd_labels = {'bullish_cross': '⬆ Cruce Alcista', 'bearish_cross': '⬇ Cruce Bajista', 'none': 'Sin cruce'}
+    print(Fore.CYAN + "│" + f"  MACD: {Fore.WHITE}{macd_labels.get(tech['macd_cross'], 'Sin cruce')}  (Hist: {tech['macd_hist']:.4f})".ljust(w + 9) + Fore.CYAN + "│")
+
+    bb_val = tech['bb_percent_b']
+    if tech['bb_squeeze']:
+        bb_display = "SQUEEZE ⚡"
+    elif tech['bb_breakout'] != 'none':
+        bb_display = tech['bb_breakout'].replace('_', ' ').title()
+    else:
+        bb_display = f"%B={bb_val:.2f}"
+    print(Fore.CYAN + "│" + f"  Bollinger: {Fore.WHITE}{bb_display}".ljust(w + 9) + Fore.CYAN + "│")
+    print(Fore.CYAN + "│" + f"  EMA Ribbon: {Fore.WHITE}{trend_es.get(tech['ema_alignment'], tech['ema_alignment'])}".ljust(w + 9) + Fore.CYAN + "│")
+
+    print(Fore.CYAN + "│" + f"  Soporte: {Fore.GREEN}{fmt(tech['support'])}  {Fore.WHITE}Resistencia: {Fore.RED}{fmt(tech['resistance'])}".ljust(w + 27) + Fore.CYAN + "│")
+
+    print(Fore.CYAN + "├" + "─" * w + "┤")
+
+    # Score de confluencia
+    print(Fore.CYAN + "│" + f"  Compra: {Fore.GREEN}{buy_bar} {signal.score_compra}/100".ljust(w + 9) + Fore.CYAN + "│")
+    print(Fore.CYAN + "│" + f"  Venta:  {Fore.RED}{sell_bar} {signal.score_venta}/100".ljust(w + 9) + Fore.CYAN + "│")
+    print(Fore.CYAN + "│" + f"  → {dir_color}{signal.resumen}".ljust(w + 9) + Fore.CYAN + "│")
+
+    # Risk profile si hay alerta
+    if risk_profile and signal.es_alerta:
+        print(Fore.CYAN + "├" + "─" * w + "┤")
+        print(Fore.CYAN + "│" + f"  {Fore.WHITE}Stop Loss: {Fore.RED}{fmt(risk_profile.stop_loss)}  {Fore.WHITE}TP1: {Fore.GREEN}{fmt(risk_profile.take_profit_1)}  {Fore.WHITE}TP2: {Fore.GREEN}{fmt(risk_profile.take_profit_2)}".ljust(w + 27) + Fore.CYAN + "│")
+        print(Fore.CYAN + "│" + f"  {Fore.WHITE}R:R: {risk_profile.ratio_rr}:1  │  Posición: {risk_profile.posicion_sugerida} u  │  Riesgo: ${risk_profile.riesgo_total_usd:,.2f}".ljust(w + 9) + Fore.CYAN + "│")
+
+    print(Fore.CYAN + Style.BRIGHT + "└" + "─" * w + "┘")
+
+
+# ──────────────────────────────────────────────────────────────
+# Alert Cooldown
+# ──────────────────────────────────────────────────────────────
+
+def is_alert_on_cooldown(state, alert_type):
+    """Verifica si la alerta está en período de cooldown."""
+    last_time = state.get("last_alert_time")
+    last_type = state.get("last_alert_type")
+    if last_time and last_type == alert_type:
+        try:
+            last_dt = datetime.fromisoformat(str(last_time))
+            if datetime.now() - last_dt < timedelta(minutes=ALERT_COOLDOWN_MIN):
+                return True
+        except (ValueError, TypeError):
+            pass
+    return False
+
+
+# ──────────────────────────────────────────────────────────────
+# Bucle Principal
+# ──────────────────────────────────────────────────────────────
+
+def run_agent(tickers_info, risk_mgr, poll_interval=60, notifier=None, once=False):
+    """Bucle principal del agente profesional."""
     features = ['Open', 'High', 'Low', 'Close', 'Volume']
+    fetchers = {t: DataFetcher(t) for t in tickers_info}
+    states = {t: load_state(t) for t in tickers_info}
 
-    # Load persistent state
-    state = load_state(ticker)
-    last_trend = state.get("last_trend", "neutral")
-    last_price = state.get("last_price", 0.0)
-
-    if not once:
-        print(Fore.CYAN + Style.BRIGHT + f"\n{'='*58}")
-        print(Fore.CYAN + Style.BRIGHT + f"  Real-Time Market Monitor  |  Ticker: {ticker}")
-        print(Fore.CYAN + Style.BRIGHT + f"{'='*58}")
-        print(f"  Poll interval : {poll_interval}s")
-        print(f"  Telegram alerts: {'Enabled' if (telegram_notifier and telegram_notifier.bot_token) else 'Disabled'}")
-        print(Fore.CYAN + Style.BRIGHT + f"{'='*58}\n")
-        print("Press Ctrl+C to stop.\n")
-
+    cycle = 0
     try:
         while True:
-            # ── Fetch latest bars ──────────────────────────────
-            # 15m interval is a better balance for reliability
-            df = fetcher.fetch_latest_data(period="5d", interval="15m", last_n=100)
-            if df.empty:
-                if once:
-                    print(Fore.RED + "[!] Failed to fetch recent data. Exiting.")
-                    break
-                print(Fore.RED + "[!] Failed to fetch recent data. Retrying...")
-                time.sleep(poll_interval)
-                continue
+            cycle += 1
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-            current_time = df['Datetime'].iloc[-1]
-            current_close = float(df['Close'].iloc[-1])
+            if not once:
+                print(Fore.CYAN + Style.DIM + f"\n{'─' * 74}")
+                print(Fore.CYAN + Style.DIM + f"  Ciclo #{cycle}  │  {timestamp}")
+                print(Fore.CYAN + Style.DIM + f"{'─' * 74}")
 
+            for ticker, (model, scaler) in tickers_info.items():
+                fetcher = fetchers[ticker]
+                state = states[ticker]
 
-            # ── Technical Analysis ─────────────────────────────
-            supports, resistances = identify_support_resistance(df['Close'], window=5)
-            below_supports = [s for s in supports if s < current_close]
-            above_resistances = [r for r in resistances if r > current_close]
+                # ── Datos ──────────────────────────────────────────
+                df = fetcher.fetch_latest_data(period="5d", interval="15m", last_n=100)
+                if df.empty:
+                    print(Fore.RED + f"  ✗ [{ticker}] Sin datos disponibles")
+                    logger.warning(f"{ticker}: Sin datos en este ciclo")
+                    continue
 
-            closest_supp = max(below_supports) if below_supports else 0.0
-            closest_res = min(above_resistances) if above_resistances else float('inf')
+                current_close = float(df['Close'].iloc[-1])
+                last_trend = state.get("last_trend", "neutral")
 
-            tech_trend = detect_trend(df['Close'], short_ma=5, long_ma=20)
+                # ── Análisis Técnico Completo ──────────────────────
+                tech = full_technical_analysis(df)
 
-            # ── Transformer Prediction ─────────────────────────
-            recent_data = df[features].tail(SEQ_LENGTH).values
-            if len(recent_data) < SEQ_LENGTH:
-                print(Fore.YELLOW + f"[{current_time}] Waiting for more data ({len(recent_data)}/{SEQ_LENGTH} bars)...")
-                time.sleep(poll_interval)
-                continue
+                # ── Predicción IA ──────────────────────────────────
+                recent_data = df[features].tail(SEQ_LENGTH).values
+                if len(recent_data) < SEQ_LENGTH:
+                    print(Fore.YELLOW + f"  ⏳ [{ticker}] Esperando datos ({len(recent_data)}/{SEQ_LENGTH})")
+                    continue
 
-            scaled_recent = scaler.transform(recent_data).astype(np.float32)
-            input_tensor = torch.tensor(scaled_recent).unsqueeze(0)  # (1, SEQ_LENGTH, 5)
+                scaled = scaler.transform(recent_data).astype(np.float32)
+                inp = torch.tensor(scaled).unsqueeze(0)
+                model.eval()
+                with torch.no_grad():
+                    out = model(inp)
+                    pred_idx = torch.argmax(out, dim=1).item()
+                    confidence = torch.softmax(out, dim=1)[0][pred_idx].item()
 
-            model.eval()
-            with torch.no_grad():
-                output = model(input_tensor)
-                pred_idx = torch.argmax(output, dim=1).item()
-                confidence = torch.softmax(output, dim=1)[0][pred_idx].item()
+                ai_trend = {0: 'bearish', 1: 'neutral', 2: 'bullish'}[pred_idx]
 
-            pred_mapping = {0: 'bearish', 1: 'neutral', 2: 'bullish'}
-            model_trend = pred_mapping[pred_idx]
+                # ── Motor de Señales ───────────────────────────────
+                signal = evaluate_signal(tech, ai_trend, confidence)
 
-            # ── Combined Signal ────────────────────────────────
-            # Bullish only if BOTH tech MA and model agree (or model is neutral/bullish when tech is bullish)
-            if tech_trend == 'bullish' and model_trend != 'bearish':
-                combined_trend = 'bullish'
-            elif tech_trend == 'bearish' and model_trend != 'bullish':
-                combined_trend = 'bearish'
-            else:
-                combined_trend = model_trend  # model as tiebreaker
-
-            # ── Status Print ───────────────────────────────────
-            trend_color = Fore.GREEN if combined_trend == 'bullish' else Fore.RED if combined_trend == 'bearish' else Fore.YELLOW
-            print(f"\n--- Update @ {current_time} ---")
-            print(f"  Price        : {Fore.WHITE}{fmt_price(current_close)}")
-            print(f"  Support      : {Fore.GREEN}{fmt_price(closest_supp)}   "
-                  f"Resistance: {Fore.RED}{fmt_price(closest_res)}")
-            print(f"  Tech Trend   : {trend_color}{tech_trend.upper()}")
-            print(f"  AI Prediction: {trend_color}{model_trend.upper()} (confidence: {confidence:.1%})")
-            print(f"  Combined     : {trend_color}{combined_trend.upper()}")
-
-            # ── Alert Logic ────────────────────────────────────
-            if last_trend == 'bearish' and combined_trend == 'bullish':
-                msg = (
-                    f"🟢 *[ALERT] BULLISH REVERSAL — {ticker}*\n"
-                    f"Price: {fmt_price(current_close)}\n"
-                    f"AI confidence: {confidence:.1%}\n"
-                )
-                if closest_supp > 0:
-                    msg += f"Bounced off support at {fmt_price(closest_supp)}\n"
-                if closest_res < float('inf'):
-                    msg += (
-                        f"━━━━━━━━━━━━━━━━━\n"
-                        f"✅ *ACTION*: BUY {ticker}\n"
-                        f"🛑 *STOP LOSS*: {fmt_price(closest_supp * 0.995)}\n"
-                        f"🎯 *TAKE PROFIT*: {fmt_price(closest_res)}"
+                # ── Calcular Riesgo ────────────────────────────────
+                risk_profile = None
+                if signal.es_alerta:
+                    risk_profile = risk_mgr.calculate_risk(
+                        precio=current_close,
+                        atr=tech['atr'],
+                        direccion=signal.direccion,
+                        soporte=tech['support'],
+                        resistencia=tech['resistance'],
                     )
+
+                # ── Dashboard ──────────────────────────────────────
+                print_ticker_analysis(ticker, current_close, tech, signal, risk_profile)
+
+                # ── Determinar tendencia combinada ─────────────────
+                if signal.score_compra > signal.score_venta and signal.score_compra >= 40:
+                    combined_trend = 'bullish'
+                elif signal.score_venta > signal.score_compra and signal.score_venta >= 40:
+                    combined_trend = 'bearish'
                 else:
-                    msg += f"━━━━━━━━━━━━━━━━━\n✅ *ACTION*: BUY {ticker}\n🛑 *STOP LOSS*: {fmt_price(closest_supp * 0.995)}"
+                    combined_trend = 'neutral'
 
-                print(Fore.GREEN + Style.BRIGHT + "\n" + "=" * 58)
-                print(Fore.GREEN + Style.BRIGHT + msg.replace("*", ""))
-                print(Fore.GREEN + Style.BRIGHT + "=" * 58)
-                if telegram_notifier:
-                    telegram_notifier.send_message(msg)
+                # ── Alertas ────────────────────────────────────────
+                if signal.es_alerta and not is_alert_on_cooldown(state, signal.direccion):
+                    # Log detallado
+                    logger.info(
+                        f"ALERTA {signal.direccion} — {ticker} @ {fmt(current_close)} | "
+                        f"Score: {max(signal.score_compra, signal.score_venta)}/100 | "
+                        f"Fuerza: {signal.fuerza}"
+                    )
+                    for d in signal.detalles:
+                        logger.info(f"  └─ {d.nombre}: +{d.puntos}/{d.max_puntos} — {d.razon}")
 
-            elif last_trend == 'bullish' and combined_trend == 'bearish':
-                msg = (
-                    f"🔴 *[ALERT] BEARISH REVERSAL — {ticker}*\n"
-                    f"Price: {fmt_price(current_close)}\n"
-                    f"AI confidence: {confidence:.1%}\n"
-                    f"━━━━━━━━━━━━━━━━━\n"
-                    f"⚠️ *ACTION*: SELL / TAKE PROFITS"
-                )
-                print(Fore.RED + Style.BRIGHT + "\n" + "=" * 58)
-                print(Fore.RED + Style.BRIGHT + msg.replace("*", ""))
-                print(Fore.RED + Style.BRIGHT + "=" * 58)
-                if telegram_notifier:
-                    telegram_notifier.send_message(msg)
+                    # Consola
+                    alert_color = Fore.GREEN if signal.direccion == 'COMPRA' else Fore.RED
+                    print()
+                    print(alert_color + Style.BRIGHT + "  ╔══════════════════════════════════════════════════════════╗")
+                    print(alert_color + Style.BRIGHT + f"  ║  ¡ALERTA {signal.direccion}!  │  {ticker}  │  {signal.fuerza}".ljust(61) + "║")
+                    print(alert_color + Style.BRIGHT + "  ╚══════════════════════════════════════════════════════════╝")
 
-            else:
-                print(f"  Status       : No structural change. Holding {trend_color}{combined_trend.upper()}{'':>5}")
+                    # Detalles confluencia
+                    for d in signal.detalles:
+                        print(f"    ✓ {d.nombre}: +{d.puntos} pts — {d.razon}")
 
-            # Update and persist state
-            last_trend = combined_trend
-            last_price = current_close
-            save_state(ticker, {"last_trend": last_trend, "last_price": last_price})
+                    # Telegram
+                    if notifier and notifier.bot_token and risk_profile:
+                        risk_text = format_risk_profile(risk_profile, signal.direccion)
+                        detalles_text = "\n".join([f"  ✓ {d.nombre}: +{d.puntos} pts" for d in signal.detalles])
+                        notifier.send_alert(
+                            ticker=ticker,
+                            direccion=signal.direccion,
+                            score=max(signal.score_compra, signal.score_venta),
+                            fuerza=signal.fuerza,
+                            precio=current_close,
+                            risk_text=risk_text,
+                            detalles_text=detalles_text,
+                        )
+
+                    # Actualizar cooldown
+                    state["last_alert_time"] = datetime.now().isoformat()
+                    state["last_alert_type"] = signal.direccion
+
+                    # Historial
+                    history = state.get("alert_history", [])
+                    history.append({
+                        "time": datetime.now().isoformat(),
+                        "type": signal.direccion,
+                        "price": current_close,
+                        "score": max(signal.score_compra, signal.score_venta),
+                    })
+                    state["alert_history"] = history[-50:]  # últimas 50
+
+                # ── Notificar cambio de tendencia ──────────────────
+                if last_trend != combined_trend and combined_trend != 'neutral' and last_trend != 'neutral':
+                    trend_names = {'bullish': 'ALCISTA', 'bearish': 'BAJISTA'}
+                    print(Fore.MAGENTA + Style.BRIGHT + f"\n  🔄 CAMBIO DE TENDENCIA: {trend_names.get(last_trend, last_trend)} → {trend_names.get(combined_trend, combined_trend)}")
+                    logger.info(f"Cambio tendencia {ticker}: {last_trend} → {combined_trend}")
+
+                    if notifier and notifier.bot_token:
+                        notifier.send_trend_change(ticker, current_close, last_trend, combined_trend)
+
+                # ── Guardar estado ─────────────────────────────────
+                state["last_trend"] = combined_trend
+                state["last_price"] = current_close
+                states[ticker] = state
+                save_state(ticker, state)
 
             if once:
-                print(Fore.CYAN + "\n[*] Single run complete. State saved.")
                 break
-
             time.sleep(poll_interval)
 
-
     except KeyboardInterrupt:
-        print(Fore.CYAN + "\n\n[*] Agent stopped by user. Goodbye!")
+        print(Fore.CYAN + "\n\n  ✓ Agente detenido. ¡Hasta pronto!")
+        logger.info("Agente detenido por el usuario.")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -320,55 +451,88 @@ def run_realtime_agent(ticker, model, scaler, poll_interval=60, telegram_notifie
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Real-time Market Monitor Agent — Transformer + Technical Analysis"
+        description="Agente de Trading Profesional — Confluencia + IA"
     )
-    parser.add_argument("--ticker",    type=str, default="AAPL",
-                        help="Ticker symbol to monitor (default: AAPL)")
+    parser.add_argument("--tickers",   type=str, default="BTC-USD,GC=F",
+                        help="Tickers separados por coma (default: BTC-USD,GC=F)")
     parser.add_argument("--interval",  type=int, default=60,
-                        help="Polling interval in seconds (default: 60)")
+                        help="Intervalo de consulta en segundos (default: 60)")
+    parser.add_argument("--capital",   type=float, default=10000.0,
+                        help="Capital total para position sizing (default: 10000)")
+    parser.add_argument("--riesgo",    type=float, default=1.0,
+                        help="Porcentaje de riesgo por operación (default: 1.0)")
+    parser.add_argument("--atr-mult",  type=float, default=1.5,
+                        help="Multiplicador ATR para stop loss (default: 1.5)")
     parser.add_argument("--retrain",   action="store_true",
-                        help="Force re-training even if a saved model exists")
+                        help="Forzar re-entrenamiento del modelo")
     parser.add_argument("--tg-token",  type=str, default=None,
-                        help="Telegram Bot Token (overrides .env)")
+                        help="Telegram Bot Token")
     parser.add_argument("--tg-chat",   type=str, default=None,
-                        help="Telegram Chat ID (overrides .env)")
+                        help="Telegram Chat ID")
     parser.add_argument("--once",      action="store_true",
-                        help="Run a single iteration and exit (for automation)")
+                        help="Ejecutar una sola vez y salir")
     args = parser.parse_args()
 
-    # Telegram credentials: CLI arg > .env file
+    # Telegram
     tg_token = args.tg_token or os.getenv("TELEGRAM_BOT_TOKEN")
-    tg_chat  = args.tg_chat  or os.getenv("TELEGRAM_CHAT_ID")
+    tg_chat = args.tg_chat or os.getenv("TELEGRAM_CHAT_ID")
     notifier = TelegramNotifier(bot_token=tg_token, chat_id=tg_chat)
 
-    # ── Ticker Verification ────────────────────────────────
-    fetcher = DataFetcher(args.ticker)
-    if not fetcher.verify_ticker():
-        print(Fore.RED + f"[!] Ticker {args.ticker} seems invalid or has no data. Please check.")
+    # Risk Manager
+    risk_mgr = RiskManager(capital=args.capital, riesgo_pct=args.riesgo, atr_multiplier=args.atr_mult)
+
+    # Inicializar tickers
+    ticker_list = [t.strip() for t in args.tickers.split(",")]
+    tickers_info = {}
+
+    print(Fore.CYAN + Style.BRIGHT + "\n  Inicializando activos...")
+    print(Fore.CYAN + "  " + "─" * 40)
+
+    for ticker in ticker_list:
+        print(Fore.YELLOW + f"  → {ticker}...", end=" ")
+        fetcher = DataFetcher(ticker)
+        if not fetcher.verify_ticker():
+            print(Fore.RED + "✗ inválido")
+            continue
+
+        model, scaler = None, None
+        if not args.retrain:
+            model, scaler = load_model(ticker)
+
+        if model is None:
+            print()
+            model, scaler = train_model(ticker, period="60d", interval="1h")
+            if model is None:
+                print(Fore.RED + f"  ✗ Error al entrenar {ticker}")
+                continue
+        else:
+            print(Fore.GREEN + "✓")
+
+        tickers_info[ticker] = (model, scaler)
+
+    if not tickers_info:
+        print(Fore.RED + "\n  ✗ No hay activos válidos. Saliendo.")
         exit(1)
 
-    # ── Model Initialization ────────────────────────────────
-    model, scaler = None, None
-    if not args.retrain:
-        model, scaler = load_model(args.ticker)
+    # Header
+    if not args.once:
+        print_header(tickers_info, args.interval, args.capital, notifier)
+        if notifier and notifier.bot_token:
+            notifier.send_message(
+                f"🚀 *Agente de Trading Iniciado*\n"
+                f"Activos: `{', '.join(tickers_info.keys())}`\n"
+                f"Capital: `${args.capital:,.2f}`\n"
+                f"Riesgo: `{args.riesgo}%` por operación\n"
+                f"Intervalo: `{args.interval}s`"
+            )
 
-    if model is None:
-        # Train on 60d of hourly data (1h is the finest resolution yfinance allows over 60d)
-        model, scaler = train_model(args.ticker, period="60d", interval="1h")
-        if model is None:
-            print(Fore.RED + "[!] Model initialization failed. Exiting.")
-            exit(1)
-    
-    # Send startup notification (skip in 'once' mode to avoid spam)
-    if not args.once and notifier and notifier.bot_token:
-        notifier.send_message(f"🚀 *Market Monitor Started*\nTicker: `{args.ticker}`\nInterval: `{args.interval}s`\nStatus: Monitoring for reversals...")
+    logger.info(f"Agente iniciado: {', '.join(tickers_info.keys())} | Capital: ${args.capital:,.2f}")
 
-    # ── Start Agent ─────────────────────────────────────────
-    run_realtime_agent(
-        args.ticker,
-        model,
-        scaler,
+    # ── Ejecutar ───────────────────────────────────────────
+    run_agent(
+        tickers_info,
+        risk_mgr,
         poll_interval=args.interval,
-        telegram_notifier=notifier,
-        once=args.once
+        notifier=notifier,
+        once=args.once,
     )

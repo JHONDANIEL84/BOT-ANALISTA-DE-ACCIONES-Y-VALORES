@@ -61,7 +61,8 @@ class DataFetcher:
         """Verify if the ticker is valid and has recent data."""
         try:
             stock = yf.Ticker(self.ticker)
-            df = stock.history(period="1d")
+            # Use 5d instead of 1d to account for weekends/holidays
+            df = stock.history(period="5d")
             return not df.empty
         except:
             return False
