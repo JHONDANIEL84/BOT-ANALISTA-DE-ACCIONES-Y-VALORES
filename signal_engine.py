@@ -67,18 +67,28 @@ def evaluate_signal(tech: Dict, ai_trend: str, ai_confidence: float, macro_trend
     sell_pts = 0
     details_buy = []
     details_sell = []
+    
+    regime = tech.get('market_regime', 'random')
+    is_trending = regime == 'trending'
+    is_mean_reverting = regime == 'mean_reverting'
+
+    # Modificadores de peso basados en régimen (Institutional feature)
+    trend_weight = 1.5 if is_trending else 0.5 if is_mean_reverting else 1.0
+    mr_weight = 1.5 if is_mean_reverting else 0.5 if is_trending else 1.0
 
     # ── 1. Tendencia por Media Móvil (max 15 pts) ─────────────
+    # Este es un indicador de tendencia
+    ma_pts = int(15 * trend_weight)
     ma = tech['ma_trend']
     if ma == 'bullish':
-        buy_pts += 15
-        details_buy.append(SignalDetail("Media Móvil", 15, 15, "MA corta > MA larga → alcista"))
+        buy_pts += ma_pts
+        details_buy.append(SignalDetail("Media Móvil", ma_pts, ma_pts, f"MA corta > MA larga ({regime} x{trend_weight})"))
     elif ma == 'bearish':
-        sell_pts += 15
-        details_sell.append(SignalDetail("Media Móvil", 15, 15, "MA corta < MA larga → bajista"))
+        sell_pts += ma_pts
+        details_sell.append(SignalDetail("Media Móvil", ma_pts, ma_pts, f"MA corta < MA larga ({regime} x{trend_weight})"))
     else:
-        details_buy.append(SignalDetail("Media Móvil", 0, 15, "Sin cruce claro"))
-        details_sell.append(SignalDetail("Media Móvil", 0, 15, "Sin cruce claro"))
+        details_buy.append(SignalDetail("Media Móvil", 0, ma_pts, "Sin cruce claro"))
+        details_sell.append(SignalDetail("Media Móvil", 0, ma_pts, "Sin cruce claro"))
 
     # ── 2. ADX — Fuerza de Tendencia (max 10 pts) ─────────────
     adx = tech['adx']
@@ -94,20 +104,22 @@ def evaluate_signal(tech: Dict, ai_trend: str, ai_confidence: float, macro_trend
         details_sell.append(SignalDetail("ADX", 0, 10, f"ADX {adx:.0f} débil — sin tendencia clara"))
 
     # ── 3. RSI — Zona Favorable (max 10 pts) ──────────────────
+    # El RSI extremo es útil en reversión a la media
+    rsi_pts = int(10 * mr_weight)
     rsi = tech['rsi']
     if tech['rsi_favorable_buy'] and not tech['rsi_overbought']:
-        buy_pts += 10
-        details_buy.append(SignalDetail("RSI", 10, 10, f"RSI {rsi:.0f} en zona de compra favorable"))
+        buy_pts += 5
+        details_buy.append(SignalDetail("RSI", 5, rsi_pts, f"RSI {rsi:.0f} en zona de compra favorable"))
     elif tech['rsi_oversold']:
-        buy_pts += 10
-        details_buy.append(SignalDetail("RSI", 10, 10, f"RSI {rsi:.0f} sobreventa → rebote probable"))
+        buy_pts += rsi_pts
+        details_buy.append(SignalDetail("RSI", rsi_pts, rsi_pts, f"RSI {rsi:.0f} sobreventa ({regime} x{mr_weight})"))
     
     if tech['rsi_favorable_sell'] and not tech['rsi_oversold']:
-        sell_pts += 10
-        details_sell.append(SignalDetail("RSI", 10, 10, f"RSI {rsi:.0f} en zona de venta favorable"))
+        sell_pts += 5
+        details_sell.append(SignalDetail("RSI", 5, rsi_pts, f"RSI {rsi:.0f} en zona de venta favorable"))
     elif tech['rsi_overbought']:
-        sell_pts += 10
-        details_sell.append(SignalDetail("RSI", 10, 10, f"RSI {rsi:.0f} sobrecompra → caída probable"))
+        sell_pts += rsi_pts
+        details_sell.append(SignalDetail("RSI", rsi_pts, rsi_pts, f"RSI {rsi:.0f} sobrecompra ({regime} x{mr_weight})"))
 
     # ── 4. MACD Cruce (max 15 pts) ────────────────────────────
     macd_cross = tech['macd_cross']
@@ -151,16 +163,18 @@ def evaluate_signal(tech: Dict, ai_trend: str, ai_confidence: float, macro_trend
             details_sell.append(SignalDetail("Bollinger", 5, 10, f"%B={pct_b:.2f} cerca de banda superior → sobrecompra"))
 
     # ── 6. EMA Ribbon (max 10 pts) ────────────────────────────
+    # Indicador de tendencia
+    ema_pts = int(10 * trend_weight)
     ema = tech['ema_alignment']
     if ema == 'bullish':
-        buy_pts += 10
-        details_buy.append(SignalDetail("EMA Ribbon", 10, 10, "EMAs perfectamente alineadas al alza"))
+        buy_pts += ema_pts
+        details_buy.append(SignalDetail("EMA Ribbon", ema_pts, ema_pts, f"EMAs alcistas ({regime} x{trend_weight})"))
     elif ema == 'bearish':
-        sell_pts += 10
-        details_sell.append(SignalDetail("EMA Ribbon", 10, 10, "EMAs perfectamente alineadas a la baja"))
+        sell_pts += ema_pts
+        details_sell.append(SignalDetail("EMA Ribbon", ema_pts, ema_pts, f"EMAs bajistas ({regime} x{trend_weight})"))
     else:
-        details_buy.append(SignalDetail("EMA Ribbon", 0, 10, "EMAs mixtas — sin alineación"))
-        details_sell.append(SignalDetail("EMA Ribbon", 0, 10, "EMAs mixtas — sin alineación"))
+        details_buy.append(SignalDetail("EMA Ribbon", 0, ema_pts, "EMAs mixtas — sin alineación"))
+        details_sell.append(SignalDetail("EMA Ribbon", 0, ema_pts, "EMAs mixtas — sin alineación"))
 
     # ── 7. Price Action HH/HL o LH/LL (max 10 pts) ───────────
     pa = tech['pa_trend']
@@ -187,12 +201,14 @@ def evaluate_signal(tech: Dict, ai_trend: str, ai_confidence: float, macro_trend
         details_sell.append(SignalDetail("Modelo IA", 0, 15, f"Predicción NEUTRAL ({ai_confidence:.0%})"))
 
     # ── 9. Stochastic RSI (max 5 pts) ─────────────────────────
+    # Reversión a la media
+    stoch_pts = int(5 * mr_weight)
     if tech['stoch_oversold']:
-        buy_pts += 5
-        details_buy.append(SignalDetail("Stoch RSI", 5, 5, f"K={tech['stoch_k']:.0f} sobreventa extrema"))
+        buy_pts += stoch_pts
+        details_buy.append(SignalDetail("Stoch RSI", stoch_pts, stoch_pts, f"K={tech['stoch_k']:.0f} sobreventa ({regime} x{mr_weight})"))
     elif tech['stoch_overbought']:
-        sell_pts += 5
-        details_sell.append(SignalDetail("Stoch RSI", 5, 5, f"K={tech['stoch_k']:.0f} sobrecompra extrema"))
+        sell_pts += stoch_pts
+        details_sell.append(SignalDetail("Stoch RSI", stoch_pts, stoch_pts, f"K={tech['stoch_k']:.0f} sobrecompra ({regime} x{mr_weight})"))
 
     # ── 10. MTF Macro Trend Penalty ───────────────────────────
     if macro_trend == 'bullish':

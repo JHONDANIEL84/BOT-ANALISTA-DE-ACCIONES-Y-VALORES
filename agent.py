@@ -61,10 +61,27 @@ os.makedirs(LOG_DIR, exist_ok=True)
 logger = logging.getLogger("MarketAgent")
 logger.setLevel(logging.DEBUG)
 
+# Normal text log
 fh = logging.FileHandler(os.path.join(LOG_DIR, "agent.log"), encoding="utf-8")
 fh.setLevel(logging.DEBUG)
 fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger.addHandler(fh)
+
+# Structured JSON log (Institutional Standard)
+json_fh = logging.FileHandler(os.path.join(LOG_DIR, "structured.jsonl"), encoding="utf-8")
+json_fh.setLevel(logging.INFO)
+class JsonFormatter(logging.Formatter):
+    def format(self, record):
+        log_record = {
+            "time": datetime.utcnow().isoformat() + "Z",
+            "level": record.levelname,
+            "message": record.getMessage()
+        }
+        if hasattr(record, 'json_data'):
+            log_record.update(record.json_data)
+        return json.dumps(log_record)
+json_fh.setFormatter(JsonFormatter())
+logger.addHandler(json_fh)
 
 ch = logging.StreamHandler()
 ch.setLevel(logging.WARNING)
@@ -248,6 +265,11 @@ def print_ticker_analysis(ticker, price, tech, signal, risk_profile=None):
     print(Fore.CYAN + Style.BRIGHT + "┌" + "─" * w + "┐")
     print(Fore.CYAN + Style.BRIGHT + "│" + f"  {ticker}  │  {fmt(price)}  │  {datetime.now().strftime('%H:%M:%S')}".ljust(w) + "│")
     print(Fore.CYAN + "├" + "─" * w + "┤")
+    
+    # ── Institutional Metrics
+    regime_color = Fore.GREEN if tech['market_regime'] == 'trending' else Fore.YELLOW if tech['market_regime'] == 'mean_reverting' else Fore.WHITE
+    print(Fore.CYAN + "│" + f"  🏛️ INSTITUCIONAL: Hurst={tech['hurst_exponent']:.2f} ({regime_color}{tech['market_regime'].upper()}{Fore.WHITE}) │ Vol Z={tech['volatility_zscore']:.2f}".ljust(w + 27) + Fore.CYAN + "│")
+    print(Fore.CYAN + "├" + "─" * w + "┤")
 
     # Indicadores clave
     rsi_color = Fore.RED if tech['rsi_overbought'] else Fore.GREEN if tech['rsi_oversold'] else Fore.WHITE
@@ -284,6 +306,7 @@ def print_ticker_analysis(ticker, price, tech, signal, risk_profile=None):
         print(Fore.CYAN + "├" + "─" * w + "┤")
         print(Fore.CYAN + "│" + f"  {Fore.WHITE}Stop Loss: {Fore.RED}{fmt(risk_profile.stop_loss)}  {Fore.WHITE}TP1: {Fore.GREEN}{fmt(risk_profile.take_profit_1)}  {Fore.WHITE}TP2: {Fore.GREEN}{fmt(risk_profile.take_profit_2)}".ljust(w + 27) + Fore.CYAN + "│")
         print(Fore.CYAN + "│" + f"  {Fore.WHITE}R:R: {risk_profile.ratio_rr}:1  │  Posición: {risk_profile.posicion_sugerida} u  │  Riesgo: ${risk_profile.riesgo_total_usd:,.2f}".ljust(w + 9) + Fore.CYAN + "│")
+        print(Fore.CYAN + "│" + f"  {Fore.WHITE}Kelly: {risk_profile.kelly_fraction:.2f}%  │  VaR(95%): ${risk_profile.var_95_1d:,.2f}  │  Fricción Est: ${risk_profile.simulated_commission + risk_profile.simulated_slippage:,.2f}".ljust(w + 9) + Fore.CYAN + "│")
 
     print(Fore.CYAN + Style.BRIGHT + "└" + "─" * w + "┘")
 
@@ -389,7 +412,15 @@ def run_agent(tickers_info, risk_mgr, poll_interval=60, notifier=None, once=Fals
                         direccion=signal.direccion,
                         soporte=tech['support'],
                         resistencia=tech['resistance'],
+                        log_returns=tech.get('log_returns')
                     )
+
+                    # Update win rate in risk manager based on state
+                    wins = state.get("wins", 0)
+                    losses = state.get("losses", 0)
+                    total_trades = wins + losses
+                    if total_trades > 10:
+                        risk_mgr.win_rate = wins / total_trades
 
                 # ── Dashboard ──────────────────────────────────────
                 print_ticker_analysis(ticker, current_close, tech, signal, risk_profile)
@@ -434,9 +465,26 @@ def run_agent(tickers_info, risk_mgr, poll_interval=60, notifier=None, once=Fals
                         state["wins"] = state.get("wins", 0) + (1 if hit_tp else 0)
                         state["losses"] = state.get("losses", 0) + (1 if hit_sl else 0)
                         
-                        logger.info(f"Trade cerrado: {ticker} -> {outcome}")
+                        # Institutional PnL with commissions
+                        pnl_gross = (active_trade["tp1"] - active_trade["entry"]) if hit_tp else (active_trade["stop_loss"] - active_trade["entry"])
+                        if active_trade["direction"] == 'VENTA':
+                            pnl_gross = -pnl_gross
+                        
+                        commission_cost = (current_close * risk_mgr.commission_rate) + (active_trade["entry"] * risk_mgr.commission_rate)
+                        slippage_cost = tech['atr'] * 0.05
+                        pnl_net = pnl_gross - commission_cost - slippage_cost
+                        
+                        logger.info(f"Trade cerrado: {ticker} -> {outcome} | Net PnL (1u): {pnl_net:.2f}", extra={
+                            "json_data": {
+                                "event": "trade_closed",
+                                "ticker": ticker,
+                                "outcome": outcome,
+                                "pnl_net": pnl_net,
+                                "hit_tp": hit_tp
+                            }
+                        })
                         if notifier and notifier.bot_token:
-                            notifier.send_message(f"{emoji} *OPERACIÓN CERRADA* — {ticker}\nResultado: {outcome}\nPrecio de salida: `${current_close:,.2f}`")
+                            notifier.send_message(f"{emoji} *OPERACIÓN CERRADA* — {ticker}\nResultado: {outcome}\nPrecio de salida: `${current_close:,.2f}`\nNet PnL est (1u): `${pnl_net:,.2f}`")
                             
                         state["active_trade"] = None
                     else:
@@ -457,7 +505,20 @@ def run_agent(tickers_info, risk_mgr, poll_interval=60, notifier=None, once=Fals
                     logger.info(
                         f"ALERTA {signal.direccion} — {ticker} @ {fmt(current_close)} | "
                         f"Score: {max(signal.score_compra, signal.score_venta)}/100 | "
-                        f"Fuerza: {signal.fuerza}"
+                        f"Fuerza: {signal.fuerza}",
+                        extra={
+                            "json_data": {
+                                "event": "signal_alert",
+                                "ticker": ticker,
+                                "direction": signal.direccion,
+                                "price": current_close,
+                                "score": max(signal.score_compra, signal.score_venta),
+                                "hurst": tech['hurst_exponent'],
+                                "regime": tech['market_regime'],
+                                "var_95": risk_profile.var_95_1d,
+                                "kelly_fraction": risk_profile.kelly_fraction
+                            }
+                        }
                     )
                     for d in signal.detalles:
                         logger.info(f"  └─ {d.nombre}: +{d.puntos}/{d.max_puntos} — {d.razon}")

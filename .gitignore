@@ -17,3 +17,7 @@ ENV/
 # VS Code / IDE
 .vscode/
 .idea/
+
+# Logs and scratch
+logs/
+scratch/

@@ -7,6 +7,7 @@ RSI, MACD, Soporte/Resistencia, Price Action.
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -279,6 +280,67 @@ def detect_trend(prices, short_ma=10, long_ma=50):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Régimen de Mercado e Institucional (Hurst, Z-Score)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def calculate_hurst_exponent(prices, max_lag=20):
+    """
+    Calcula el Exponente de Hurst matemático.
+    H < 0.5: Mean Reverting (Lateral/Rango)
+    H ~ 0.5: Random Walk (Ruido)
+    H > 0.5: Trending (Tendencia Fuerte)
+    """
+    if len(prices) < max_lag * 2:
+        return 0.5
+        
+    lags = range(2, max_lag)
+    tau = [np.sqrt(np.std(np.subtract(prices.values[lag:], prices.values[:-lag]))) for lag in lags]
+    
+    try:
+        # Fit a line a log-log plot
+        m = np.polyfit(np.log(lags), np.log(tau), 1)
+        hurst = m[0] * 2.0
+        # Clamping
+        hurst = max(0.0, min(1.0, hurst))
+        return float(hurst)
+    except:
+        return 0.5
+
+def detect_regime(hurst):
+    if hurst < 0.45:
+        return "mean_reverting"
+    elif hurst > 0.55:
+        return "trending"
+    else:
+        return "random"
+
+def calculate_volatility_zscore(atr_series, period=100):
+    """
+    Z-Score de la volatilidad (ATR) respecto a la historia reciente.
+    Ayuda a detectar regímenes de alta o baja volatilidad extrema.
+    """
+    if len(atr_series) < period:
+        return 0.0
+    
+    recent_atr = atr_series.tail(period)
+    mean = recent_atr.mean()
+    std = recent_atr.std()
+    
+    if std == 0 or pd.isna(std):
+        return 0.0
+        
+    current_atr = atr_series.iloc[-1]
+    z_score = (current_atr - mean) / std
+    return float(z_score)
+
+def get_historical_returns(prices):
+    """
+    Calcula retornos logarítmicos, usados para Value at Risk (VaR).
+    """
+    return np.log(prices / prices.shift(1)).dropna()
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Price Action — Higher Highs / Lower Lows
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -369,6 +431,12 @@ def full_technical_analysis(df):
     closest_support = max([s for s in supports if s < current_close], default=0.0)
     closest_resistance = min([r for r in resistances if r > current_close], default=float('inf'))
 
+    # Institutional Metrics (Hurst, Z-Score, Returns)
+    hurst = calculate_hurst_exponent(close)
+    regime = detect_regime(hurst)
+    vol_zscore = calculate_volatility_zscore(atr)
+    log_returns = get_historical_returns(close)
+
     return {
         # Precio
         'close': current_close,
@@ -418,4 +486,10 @@ def full_technical_analysis(df):
         # Soporte / Resistencia
         'support': closest_support,
         'resistance': closest_resistance,
+        
+        # Institucional
+        'hurst_exponent': hurst,
+        'market_regime': regime,
+        'volatility_zscore': vol_zscore,
+        'log_returns': log_returns,
     }

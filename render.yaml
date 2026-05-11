@@ -1,0 +1,12 @@
+services:
+  - type: worker
+    name: quant-trading-agent
+    env: python
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python agent.py --interval 300
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
