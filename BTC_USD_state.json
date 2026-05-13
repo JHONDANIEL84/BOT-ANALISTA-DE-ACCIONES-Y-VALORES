@@ -1,1 +1,1 @@
-{"last_trend": "bullish", "last_price": 79675.0078125, "active_trade": null, "last_alert_time": "2026-05-13T05:30:27.804917", "last_alert_type": "COMPRA", "alert_history": [{"time": "2026-05-13T05:30:27.804933", "type": "COMPRA", "price": 81113.546875, "score": 60}], "wins": 0, "losses": 1}
+{"last_trend": "neutral", "last_price": 79472.03125, "active_trade": null, "last_alert_time": "2026-05-13T05:30:27.804917", "last_alert_type": "COMPRA", "alert_history": [{"time": "2026-05-13T05:30:27.804933", "type": "COMPRA", "price": 81113.546875, "score": 60}], "wins": 0, "losses": 1}
